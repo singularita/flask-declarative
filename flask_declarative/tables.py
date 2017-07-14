@@ -30,6 +30,7 @@ sorting and filtering.
                 return self.column.in_(terms)
 """
 
+from logging import getLogger, NullHandler
 from collections import OrderedDict
 from numbers import Number
 from re import findall
@@ -47,6 +48,10 @@ __all__ = [
     'TextColumn',
     'NumericColumn',
 ]
+
+
+log = getLogger(__name__)
+log.addHandler(NullHandler())
 
 
 class TableMeta(type):
@@ -130,9 +135,13 @@ class Table(metaclass=TableMeta):
         start, length, value, regex, columns, order = self.parse_request()
 
         self.columns = OrderedDict()
+        options = {}
 
-        for i, (name, Col) in enumerate(self.column_types.items()):
-            self.columns[name] = Col(self, columns[i])
+        for column in columns:
+            options[column['data']] = column
+
+        for name, Col in self.column_types.items():
+            self.columns[name] = Col(self, options.get(name, {}))
 
         self.total = self.query.count()
 
@@ -179,15 +188,32 @@ class Table(metaclass=TableMeta):
         start = request.args.get('start', 0, type=int)
         length = request.args.get('length', 50, type=int)
 
-        value = request.args.get('search[value]', '')
-        regex = request.args.get('search[regex]', False, type=boolean)
+        search_value = request.args.get('search[value]', '')
+        search_regex = request.args.get('search[regex]', False, type=boolean)
 
         columns = []
         order = []
 
-        for i in range(len(self.column_types)):
-            data = request.args.get('columns[{}][data]'.format(i), 0, type=int)
-            name = request.args.get('columns[{}][name]'.format(i), 0)
+        # Iterate over up to 100 columns from the request and break as soon
+        # as we do not find a corresponding data source specification.
+        for i in range(100):
+            key = 'columns[{}][data]'.format(i)
+
+            if key not in request.args:
+                break
+
+            data = request.args.get(key, '')
+
+            try:
+                data = list(self.column_types)[int(data)]
+            except:
+                pass
+
+            if not data in self.column_types:
+                data = None
+
+            key = 'columns[{}][name]'.format(i)
+            name = request.args.get(key, 0)
 
             key = 'columns[{}][searchable]'.format(i)
             searchable = request.args.get(key, True, type=boolean)
@@ -196,10 +222,10 @@ class Table(metaclass=TableMeta):
             orderable = request.args.get(key, True, type=boolean)
 
             key = 'columns[{}][search][value]'.format(i)
-            search_value = request.args.get(key, '')
+            value = request.args.get(key, '')
 
             key = 'columns[{}][search][regex]'.format(i)
-            search_regex = request.args.get(key, '', type=boolean)
+            regex = request.args.get(key, '', type=boolean)
 
             columns.append({
                 'data': data,
@@ -210,7 +236,8 @@ class Table(metaclass=TableMeta):
                 'regex': regex,
             })
 
-        for i in range(len(self.column_types)):
+        # Similar to columns, iterate over up to 100 ordering clauses.
+        for i in range(100):
             key = 'order[{}][column]'.format(i)
 
             if key not in request.args:
@@ -218,14 +245,20 @@ class Table(metaclass=TableMeta):
 
             column = request.args.get(key, 0, type=int)
 
-            if column >= len(self.column_types) or column < 0:
-                continue
-
             key = 'order[{}][dir]'.format(i)
             direction = request.args.get(key, 'asc')
 
-            column = list(self.column_types.keys())[column]
-            order.append((column, direction))
+            try:
+                column = columns[column]
+            except IndexError:
+                continue
+
+            if column['data'] is None:
+                log.warning('Cannot order column without data: {!r}' \
+                            .format(column))
+                continue
+
+            order.append((column['data'], direction))
 
         return (start, length, search_value, search_regex, columns, order)
 
@@ -238,10 +271,10 @@ class Table(metaclass=TableMeta):
         data = []
 
         for row in self.rows:
-            data.append([])
+            data.append({})
 
             for column in self.columns.values():
-                data[-1].append(column.extract(row))
+                data[-1][column.name] = column.extract(row)
 
         columns = []
 
@@ -273,10 +306,10 @@ class Column:
     def __init__(self, table, options):
         self.table = table
 
-        self.searchable = options['searchable']
-        self.orderable = options['orderable']
-        self.filter_value = options['value']
-        self.filter_regex = options['regex']
+        self.searchable = options.get('searchable', True)
+        self.orderable = options.get('orderable', True)
+        self.filter_value = options.get('value', '')
+        self.filter_regex = options.get('regex', False)
 
     def order(self, direction):
         """
