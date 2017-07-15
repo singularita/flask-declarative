@@ -10,390 +10,204 @@ sorting and filtering.
 
 .. code-block:: python
 
-    class UserTable(Table):
-        query = db.user
-
-        class id(NumericColumn):
-            label = _('ID')
-            column = db.user.c.id
-
-        class name(TextColumn):
-            label = _('Name')
-            column = db.user.c.name
-
-        class roles(Column):
-            label = _('Roles')
-            column = db.user.c.roles
-
-            def search(self, keyword, regex=False):
-                terms = re.findall(r'\S+', pattern):
-                return self.column.in_(terms)
+    @app.route('/table/data', methods=['POST'])
+    def table_data():
+        q = db.session.query(db.document.year,
+                             db.document.summary,
+                             db.document.total)
+        return jsonify(dt_json(q, request.json))
 """
 
-from logging import getLogger, NullHandler
-from collections import OrderedDict
 from numbers import Number
 from re import findall
 
 from sqlalchemy import and_, or_
+from sqlalchemy.types import NullType
 
 from flask import request
-from flask_babel import lazy_gettext as _
+from flask_babel import format_currency, lazy_gettext as _
 
 
 __all__ = [
-    'Table',
-    'Column',
-    'SingleColumn',
-    'TextColumn',
-    'NumericColumn',
+    'dt_json',
+    'dt_query',
+    'dt_language',
 ]
 
 
-log = getLogger(__name__)
-log.addHandler(NullHandler())
+dt_language = {
+    'decimal':        '',
+    'emptyTable':     _('No entries found.'),
+    'info':           _('Showing _START_ to _END_ of _TOTAL_ entries'),
+    'infoEmpty':      _('Showing 0 to 0 of 0 entries'),
+    'infoFiltered':   _('(filtered from _MAX_ total)'),
+    'infoPostFix':    '',
+    'thousands':      ' ',
+    'lengthMenu':     _('Show _MENU_ entries'),
+    'loadingRecords': _('Loading...'),
+    'processing':     _('Processing...'),
+    'search':         _('Search:'),
+    'zeroRecords':    _('No matching entries found.'),
+    'paginate': {
+        'first':      _('First'),
+        'last':       _('Last'),
+        'next':       _('Next'),
+        'previous':   _('Previous'),
+    },
+    'aria': {
+        'sortAscending':  _(': activate to sort column ascending'),
+        'sortDescending': _(': activate to sort column descending'),
+    }
+}
+"""
+DataTables localization messages for your convenience.
+"""
 
 
-class TableMeta(type):
-    @classmethod
-    def __prepare__(metacls, name, bases, **kwds):
-        return OrderedDict()
-
-    def __new__(cls, name, bases, namespace, **kwds):
-        result = type.__new__(cls, name, bases, namespace, **kwds)
-        result.column_types = OrderedDict()
-
-        for base in bases:
-            if hasattr(base, 'column_types'):
-                result.column_types.update(base.column_types)
-
-        for orig_name, Col in list(namespace.items()):
-            if isinstance(Col, type) and issubclass(Col, Column):
-                name = orig_name
-                if orig_name.endswith('_'):
-                    name = orig_name[:-1]
-
-                delattr(result, orig_name)
-
-                result.column_types[name] = Col
-                Col.name = name
-
-                if Col.label is None:
-                    Col.label = Col.name
-
-        return result
-
-
-class Table(metaclass=TableMeta):
+def dt_json(base, request):
     """
-    Parent class for table definitions. Inherit this to create your own table
-    types to be instantiated. The base table does not specify any columns.
-    """
+    Uses :func:`dt_query` to query the database and return an
+    appropriate representation of the result for the DataTables client.
 
-    query = None
-    """
-    Base query to build on. You need to override it in the child table types.
+    Applies the ``offset`` and ``limit`` constraints.
+
+    :param base: Base SQLAlchemy query to augment with request data.
+    :param request: JSON object with the request data, usually taken
+        straight from :attr:`flask.request.json`.
     """
 
-    rows = []
-    """
-    List of row objects that match the requested parameters.
-    """
+    start = request['start']
+    length = request['length']
 
-    # DataTables localization messages.
-    dt_language = {
-        'decimal':        '',
-        'emptyTable':     _('No entries found.'),
-        'info':           _('Showing _START_ to _END_ of _TOTAL_ entries'),
-        'infoEmpty':      _('Showing 0 to 0 of 0 entries'),
-        'infoFiltered':   _('(filtered from _MAX_ total)'),
-        'infoPostFix':    '',
-        'thousands':      ' ',
-        'lengthMenu':     _('Show _MENU_ entries'),
-        'loadingRecords': _('Loading...'),
-        'processing':     _('Processing...'),
-        'search':         _('Search:'),
-        'zeroRecords':    _('No matching entries found.'),
-        'paginate': {
-            'first':      _('First'),
-            'last':       _('Last'),
-            'next':       _('Next'),
-            'previous':   _('Previous'),
-        },
-        'aria': {
-            'sortAscending':  _(': activate to sort column ascending'),
-            'sortDescending': _(': activate to sort column descending'),
-        }
+    query = dt_query(base, request)
+    data = []
+
+    for row in query.offset(start).limit(length).all():
+        data.append({})
+
+        for column in query.column_descriptions:
+            data[-1][column['name']] = getattr(row, column['name'])
+
+    return {
+        'draw': request['draw'],
+        'recordsTotal': base.count(),
+        'recordsFiltered': query.count(),
+        'data': data,
     }
 
-    def __init__(self):
-        """
-        Upon instantiation, table parameters are loaded from the current
-        :attr:`flask.request.args`.
-        """
 
-        start, length, value, regex, columns, order = self.parse_request()
+def dt_query(base, request):
+    """
+    Extend the base query so that it satisfies given DataTables request.
 
-        self.columns = OrderedDict()
-        options = {}
+    Please keep in mind that numeric query columns are always matched
+    using the ``=`` and textual columns using the ``ILIKE`` or ``~``
+    (regex) operator. For this to work correctly, data types of the base
+    query columns must be known beforehand. If you use a function or other
+    construct that does not impliciate a specific result type, annotate
+    it by calling :func:`~sqlalchemy.sql.expression.type_coerce` or
+    :func:`~sqlalchemy.sql.expression.cast`.
 
-        for column in columns:
-            options[column['data']] = column
+    Does not include the ``offset`` and ``limit`` constraints.
+    These need to be applied separately.
 
-        for name, Col in self.column_types.items():
-            self.columns[name] = Col(self, options.get(name, {}))
+    :param base: Base SQLAlchemy query to augment with data from
+       :attr:`flask.request.json`.
+    """
 
-        self.total = self.query.count()
+    # Gather introspected column objects.
+    cdefs = {}
 
-        query = self.build_query(order, value, regex)
-        self.matching = query.count()
-        self.rows = query.offset(start).limit(length).all()
+    for column in base.column_descriptions:
+        assert column['name'] is not None, \
+            'One of the columns has no name. Use label() to name it.'
 
-    def build_query(self, order, value, regex=False):
-        # XXX: Regex is not supported, I don't know how should it behave
-        #      when applied to multiple columns with different types.
+        assert not isinstance(column['expr'].type, NullType), \
+            'Column {!r} is of an unknown type. Use type_coerce().' \
+            .format(column['name'])
 
-        query = self.query
-        terms = []
+        cdefs[column['name']] = column['expr']
 
-        for column in self.columns.values():
-            terms.append(column.filter())
+    query = base
+    terms = []
 
-        query = query.filter(and_(*terms))
-        terms = []
+    for column in request['columns']:
+        if column['data'] not in cdefs:
+            continue
 
-        for term in findall(r'\S+', value):
-            maybe = []
+        cdef = cdefs[column['data']]
+        value = column['search']['value']
+        regex = column['search']['regex']
 
-            for column in self.columns.values():
-                if column.searchable:
-                    maybe.append(column.search(term))
+        terms.append(search(cdef, value, regex))
 
-            terms.append(or_(*maybe))
+    query = query.filter(and_(*terms))
+    terms = []
 
-        query = query.filter(and_(*terms))
+    regex = request['search']['regex']
+    value = request['search']['value']
 
-        ordering = []
+    for word in findall(r'\S+', value):
+        maybe = []
 
-        for (column, direction) in order:
-            if self.columns[column].orderable:
-                column_order = self.columns[column].order(direction)
-                ordering += column_order
-
-        query = query.order_by(*ordering)
-
-        return query
-
-    def parse_request(self):
-        start = request.args.get('start', 0, type=int)
-        length = request.args.get('length', 50, type=int)
-
-        search_value = request.args.get('search[value]', '')
-        search_regex = request.args.get('search[regex]', False, type=boolean)
-
-        columns = []
-        order = []
-
-        # Iterate over up to 100 columns from the request and break as soon
-        # as we do not find a corresponding data source specification.
-        for i in range(100):
-            key = 'columns[{}][data]'.format(i)
-
-            if key not in request.args:
-                break
-
-            data = request.args.get(key, '')
-
-            try:
-                data = list(self.column_types)[int(data)]
-            except:
-                pass
-
-            if not data in self.column_types:
-                data = None
-
-            key = 'columns[{}][name]'.format(i)
-            name = request.args.get(key, 0)
-
-            key = 'columns[{}][searchable]'.format(i)
-            searchable = request.args.get(key, True, type=boolean)
-
-            key = 'columns[{}][orderable]'.format(i)
-            orderable = request.args.get(key, True, type=boolean)
-
-            key = 'columns[{}][search][value]'.format(i)
-            value = request.args.get(key, '')
-
-            key = 'columns[{}][search][regex]'.format(i)
-            regex = request.args.get(key, '', type=boolean)
-
-            columns.append({
-                'data': data,
-                'name': name,
-                'searchable': searchable,
-                'orderable': orderable,
-                'value': value,
-                'regex': regex,
-            })
-
-        # Similar to columns, iterate over up to 100 ordering clauses.
-        for i in range(100):
-            key = 'order[{}][column]'.format(i)
-
-            if key not in request.args:
-                break
-
-            column = request.args.get(key, 0, type=int)
-
-            key = 'order[{}][dir]'.format(i)
-            direction = request.args.get(key, 'asc')
-
-            try:
-                column = columns[column]
-            except IndexError:
+        for column in request['columns']:
+            if not column['searchable']:
                 continue
 
-            if column['data'] is None:
-                log.warning('Cannot order column without data: {!r}' \
-                            .format(column))
+            if not column['data'] in cdefs:
                 continue
 
-            order.append((column['data'], direction))
+            cdef = cdefs[column['data']]
+            maybe.append(search(cdef, word, regex))
 
-        return (start, length, search_value, search_regex, columns, order)
+        terms.append(or_(*maybe))
 
-    def json(self):
-        """
-        Return JSON representation of the table data in a form that is
-        compatible with DataTables and also includes some column metadata.
-        """
+    query = query.filter(and_(*terms))
+    ordering = []
 
-        data = []
-
-        for row in self.rows:
-            data.append({})
-
-            for column in self.columns.values():
-                data[-1][column.name] = column.extract(row)
-
-        columns = []
-
-        for column in self.columns.values():
-            columns.append({
-                'name': column.name,
-                'label': column.label,
-            })
-
-        return {
-            'draw': request.args.get('draw', 0, type=int),
-            'recordsTotal': self.total,
-            'recordsFiltered': self.matching,
-            'data': data,
-            'columns': columns,
-        }
-
-
-class Column:
-    """
-    Parent class for column definitions.
-    """
-
-    label = None
-    """
-    Label to use when displaying the column to the user.
-    """
-
-    def __init__(self, table, options):
-        self.table = table
-
-        self.searchable = options.get('searchable', True)
-        self.orderable = options.get('orderable', True)
-        self.filter_value = options.get('value', '')
-        self.filter_regex = options.get('regex', False)
-
-    def order(self, direction):
-        """
-        Return list of ordering expressions needed to order by this column.
-        If the column is composed from multiple values, simply return more
-        expressions.
-
-        :param direction: Either ``'asc'`` or ``'desc'`` indicator of the
-            sorting other. Other values cause undefined but sane behavior.
-        """
-
-        return []
-
-    def filter(self):
-        return self.search(self.filter_value, self.filter_regex)
-
-    def search(self, keyword, regex=False):
-        """
-        Return filter expression to filter by presence of the keyword.
-
-        :param keyword: The keyword to require in the value.
-        :param regex: Boolean flag indicating that the keyword is actually a
-            regular expression to be matched against.
-        """
-
-        return or_()
-
-    def extract(self, row):
-        """
-        Extract value of the column from the row.
-        Uses :func:`getattr` by default.
-        """
-
-        return getattr(row, self.name)
-
-
-class SingleColumn(Column):
-    """
-    Column type for columns backed by a single database column.
-    """
-
-    column = None
-    """
-    SQLAlchemy column to use for filtering and ordering.
-    You need to specify this value for the column to work.
-    """
-
-    def order(self, direction):
-        if direction == 'asc':
-            return [self.column.asc()]
-
-        if direction == 'desc':
-            return [self.column.desc()]
-
-        return []
-
-
-class TextColumn(SingleColumn):
-    """
-    Column type for simple text-based cells.
-    """
-
-    def search(self, keyword, regex=False):
-        if regex:
-            return self.column.op('~')(keyword)
-
-        return self.column.ilike('%{}%'.format(keyword))
-
-
-class NumericColumn(SingleColumn):
-    """
-    Column type for simple number-based cells.
-    """
-
-    def search(self, keyword, regex=False):
+    for order in request['order']:
         try:
-            keyword = self.column.type.python_type(keyword)
-            return self.column == keyword
+            if not request['columns'][order['column']]['orderable']:
+                continue
+
+            cdef = cdefs[request['columns'][order['column']]['data']]
         except:
-            return or_()
+            continue
+
+        if order['dir'] == 'asc':
+            ordering.append(cdef.asc())
+        else:
+            ordering.append(cdef.desc())
+
+    query = query.order_by(*ordering)
+
+    return query
 
 
-def boolean(val):
-    return val == 'true'
+def search(cdef, value, regex=False):
+    ctype = cdef.type.python_type
+
+    if issubclass(ctype, Number):
+        try:
+            return cdef == ctype(value)
+        except:
+            pass
+    elif issubclass(ctype, str):
+        if regex:
+            return cdef.op('~')(value)
+        else:
+            return cdef.ilike('%{}%'.format(value))
+    elif issubclass(ctype, list):
+        ctype = cdef.type.item_type.python_type
+
+        try:
+            # This is not ideal, but I have no idea on how to match
+            # array elements better, for example using ILIKE.
+            return cdef.op('&&')([ctype(value)])
+        except:
+            pass
+
+    return or_()
 
 
 # vim:set sw=4 ts=4 et:
