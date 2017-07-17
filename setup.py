@@ -29,6 +29,7 @@ setup(**{
     'keywords': 'utilities',
     'url': 'http://github.com/singularita/flask-declarative/',
     'packages': find_packages(),
+    'zip_safe': False,
     'classifiers': [
         'Development Status :: 2 - Pre-Alpha',
         'Programming Language :: Python :: 3 :: Only',
