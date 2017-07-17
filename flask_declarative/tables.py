@@ -18,6 +18,7 @@ sorting and filtering.
         return jsonify(dt_json(q, request.json))
 """
 
+from datetime import datetime, date, time
 from numbers import Number
 from re import findall
 
@@ -86,7 +87,16 @@ def dt_json(base, request):
         data.append({})
 
         for column in query.column_descriptions:
-            data[-1][column['name']] = getattr(row, column['name'])
+            value = getattr(row, column['name'])
+
+            if isinstance(value, datetime):
+                value = value.strftime('%Y-%m-%d %H:%M:%S')
+            elif isinstance(value, date):
+                value = value.strftime('%Y-%m-%d')
+            elif isinstance(value, time):
+                value = value.strftime('%H:%M:%S')
+
+            data[-1][column['name']] = value
 
     return {
         'draw': request['draw'],
