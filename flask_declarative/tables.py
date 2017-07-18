@@ -149,7 +149,8 @@ def dt_query(base, request):
         value = column['search']['value']
         regex = column['search']['regex']
 
-        terms.append(search(cdef, value, regex))
+        if value:
+            terms.append(search(cdef, value, regex))
 
     query = query.filter(and_(*terms))
     terms = []
